@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Detected Faces (Last 30 Min)</title>
+
+    <!-- Load Firebase -->
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-database-compat.js"></script>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #121212;
+            color: white;
+            text-align: center;
+            padding: 20px;
+        }
+        h1 {
+            font-size: 24px;
+            margin-bottom: 20px;
+        }
+        table {
+            width: 80%;
+            margin: 0 auto;
+            border-collapse: collapse;
+            background: #1e1e1e;
+        }
+        th, td {
+            border: 1px solid #444;
+            padding: 10px;
+        }
+        th {
+            background: #333;
+        }
+    </style>
+</head>
+<body>
+    <h1>Detected Faces (Last 30 Min)</h1>
+    <table>
+        <thead>
+            <tr>
+                <th>Nama</th>
+                <th>NRP</th>
+                <th>Timestamp</th>
+            </tr>
+        </thead>
+        <tbody id="faces">
+            <tr><td colspan="3">Loading...</td></tr>
+        </tbody>
+    </table>
+
+    <h1>Users Not Detected</h1>
+    <table>
+        <thead>
+            <tr>
+                <th>Nama</th>
+                <th>NRP</th>
+            </tr>
+        </thead>
+        <tbody id="missing_users">
+            <tr><td colspan="2">Loading...</td></tr>
+        </tbody>
+    </table>
+
+    <script>
+        const firebaseConfig = {
+            apiKey: "AIzaSyA04tyjjGZCrqucLPNBrt4BebwtQybxurg",
+            authDomain: "face-detection-9f00c.firebaseapp.com",
+            databaseURL: "https://face-detection-9f00c-default-rtdb.asia-southeast1.firebasedatabase.app/",
+            projectId: "face-detection-9f00c",
+            storageBucket: "face-detection-9f00c.firebasestorage.app",
+            messagingSenderId: "387236614092",
+            appId: "1:387236614092:web:cc8d8d1335f670733a5769",
+            measurementId: "G-271ZL7CTKT"
+        };
+
+        firebase.initializeApp(firebaseConfig);
+        const database = firebase.database();
+        const faceLogsRef = database.ref("face_logs");
+        const usersRef = database.ref("registered_users");
+
+        function updateDetectedFaces(snapshot) {
+            const data = snapshot.val();
+            if (!data) {
+                document.getElementById("faces").innerHTML = "<tr><td colspan='3'>No faces detected.</td></tr>";
+                return;
+            }
+
+            const detectedUsers = new Map();
+            const thirtyMinutesAgo = Date.now() - 30 * 60 * 1000;
+
+            Object.values(data).forEach(log => {
+                const timestamp = new Date(log.timestamp);
+                if (timestamp >= thirtyMinutesAgo) {
+                    detectedUsers.set(log.nrp, {
+                        name: log.detected_name,
+                        nrp: log.nrp,
+                        time: new Intl.DateTimeFormat("id-ID", {
+                            timeZone: "Asia/Jakarta",
+                            year: "numeric",
+                            month: "2-digit",
+                            day: "2-digit",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                            second: "2-digit",
+                        }).format(timestamp)
+                    });
+                }
+            });
+
+            const detectedEntries = Array.from(detectedUsers.values()).map(user => 
+                `<tr><td>${user.name}</td><td>${user.nrp}</td><td>${user.time} WIB</td></tr>`
+            );
+
+            document.getElementById("faces").innerHTML = detectedEntries.length
+                ? detectedEntries.join("")
+                : "<tr><td colspan='3'>No detections in last 30 minutes.</td></tr>";
+
+            checkMissingUsers(detectedUsers);
+        }
+
+        function checkMissingUsers(detectedUsers) {
+            usersRef.once("value").then(snapshot => {
+                const registeredUsers = snapshot.val();
+                if (!registeredUsers) {
+                    document.getElementById("missing_users").innerHTML = "<tr><td colspan='2'>No registered users.</td></tr>";
+                    return;
+                }
+
+                const missingEntries = Object.values(registeredUsers)
+                    .filter(user => !detectedUsers.has(user.nrp))
+                    .map(user => `<tr><td>${user.name}</td><td>${user.nrp}</td></tr>`);
+
+                document.getElementById("missing_users").innerHTML = missingEntries.length
+                    ? missingEntries.join("")
+                    : "<tr><td colspan='2'>All users detected.</td></tr>";
+            });
+        }
+
+        faceLogsRef.on("value", updateDetectedFaces);
+    </script>
+</body>
+</html>
