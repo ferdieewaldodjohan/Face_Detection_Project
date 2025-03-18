@@ -1,106 +1,163 @@
 import cv2
 import dlib
-import pickle
+import faiss
+import json
 import numpy as np
-from scipy.spatial import distance as dist
+import datetime
+import firebase_admin
+from firebase_admin import credentials, db
+import pytz
+import time
+import threading
 
+# Firebase Setup
+cred = credentials.Certificate("face-detection-9f00c-firebase-adminsdk-fbsvc-cea00cf052.json")
+firebase_admin.initialize_app(cred, {
+    "databaseURL": "https://face-detection-9f00c-default-rtdb.asia-southeast1.firebasedatabase.app/"
+})
+
+log_ref = db.reference("face_logs")
+
+# Path model
+shape_predictor_path = "shape_predictor_68_face_landmarks_GTX.dat"
+face_recognizer_path = "taguchi_face_recognition_resnet_model_v1.dat"
+
+# FAISS Index & Names
+FAISS_INDEX_FILE = "face_encodings.index"
+NAMES_FILE = "face_data.json"
+VECTOR_DIM = 128
+
+# Load Models
 face_detector = dlib.get_frontal_face_detector()
-shape_predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks_GTX.dat")
-face_recognizer = dlib.face_recognition_model_v1("taguchi_face_recognition_resnet_model_v1.dat") 
+shape_predictor = dlib.shape_predictor(shape_predictor_path)
+face_recognizer = dlib.face_recognition_model_v1(face_recognizer_path)
 
-ENCODING_FILE = "face_encodings_dlib.pkl"
+faiss_index = faiss.read_index(FAISS_INDEX_FILE)
+with open(NAMES_FILE, "r") as f:
+    known_data = json.load(f)
 
-try:
-    with open(ENCODING_FILE, "rb") as f:
-        known_encodings, known_names = pickle.load(f)
-    # print(f"Loaded {len(known_names)} known faces.")
-except FileNotFoundError:
-    # print("File encoding tidak ditemukan! Jalankan facerecognize.py dulu.")
-    exit()
+accuracy_threshold = 60.0
+hold_time = 5  # Seconds to maintain confidence
+frame_skip = 2  # Process every 2nd frame
 
-accuracy_threshold = 40.0 
-EAR_THRESHOLD = 0.25
-BLINK_FRAMES = 2
+# Track detected faces over time
+detection_timers = {}
+lock = threading.Lock()
 
-blink_counter = 0
-blink_verified = False  
+# Store the last detected person
+last_detected_name = "No Person Detected"
+last_detected_nrp = "-"
 
-def eye_aspect_ratio(eye):
-    A = dist.euclidean(eye[1], eye[5])
-    B = dist.euclidean(eye[2], eye[4])
-    C = dist.euclidean(eye[0], eye[3])
-    return (A + B) / (2.0 * C)
+
+def push_to_firebase(name, nrp):
+    """Push detected face name, NRP & timestamp to Firebase (excluding 'Unknown')"""
+    if name != "Unknown":
+        local_tz = pytz.timezone("Asia/Jakarta")
+        timestamp = datetime.datetime.now(local_tz).isoformat()
+        log_entry = {
+            "timestamp": timestamp,
+            "detected_name": name,
+            "nrp": nrp
+        }
+        log_ref.push(log_entry)
+        print(f"✅ Logged to Firebase: {log_entry}")
+
+
+def track_face(name, nrp, accuracy):
+    """Tracks face detection over time and logs if confidence is held for 5 sec"""
+    global last_detected_name, last_detected_nrp
+    current_time = time.time()
+
+    with lock:
+        if accuracy >= accuracy_threshold:
+            last_detected_name = name
+            last_detected_nrp = nrp
+
+            if name not in detection_timers:
+                detection_timers[name] = current_time  # Start timer
+
+            elapsed_time = current_time - detection_timers[name]
+
+            if elapsed_time >= hold_time:
+                push_to_firebase(name, nrp)
+                del detection_timers[name]  # Reset timer after logging
+        else:
+            if name in detection_timers:
+                del detection_timers[name]  # Reset if confidence drops
+
+
+def process_frame(frame):
+    """Runs face detection & recognition in a separate thread"""
+    global frame_skip
+
+    # Resize for faster processing
+    small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+
+    faces = face_detector(small_frame)
+    detected_name = "Unknown"
+    detected_nrp = "Unknown"
+
+    if len(faces) > 0:
+        face = max(faces, key=lambda f: f.width() * f.height())
+
+        x, y, w, h = (face.left(), face.top(), face.width(), face.height())
+        landmarks = shape_predictor(small_frame, face)
+        encoding = np.array(face_recognizer.compute_face_descriptor(small_frame, landmarks)).astype(np.float32).reshape(1, -1)
+
+        distances, indices = faiss_index.search(encoding, 1)
+        min_distance = distances[0][0]
+        match_index = indices[0][0]
+
+        if min_distance < 0.5:
+            detected_name = known_data[match_index]["name"]
+            detected_nrp = known_data[match_index]["nrp"]
+            accuracy = (1 - min_distance / 0.5) * 100
+        else:
+            detected_name = "Unknown"
+            detected_nrp = "Unknown"
+            accuracy = 0
+
+        if accuracy < accuracy_threshold:
+            detected_name = "Unknown"
+            detected_nrp = "Unknown"
+            color = (0, 0, 255)
+        else:
+            color = (0, 255, 0)
+            track_face(detected_name, detected_nrp, accuracy)
+
+        # Draw on original frame (scale coordinates back)
+        x, y, w, h = x * 2, y * 2, w * 2, h * 2
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+        cv2.putText(frame, f"{detected_nrp} ({accuracy:.2f}%)", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
 
 def main_loop():
-    global blink_counter, blink_verified
-    video_capture = cv2.VideoCapture(0)
+    video_capture = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # Use CAP_DSHOW for better performance on Windows
+    frame_count = 0
 
     try:
         while True:
             ret, frame = video_capture.read()
             if not ret:
-                # print("Failed to capture frame.")
                 continue
 
-            faces = face_detector(frame)
+            frame_count += 1
+            if frame_count % frame_skip == 0:  # Process only every N-th frame
+                threading.Thread(target=process_frame, args=(frame.copy(),)).start()
 
-            for face in faces:
-                x, y, w, h = (face.left(), face.top(), face.width(), face.height())
-                landmarks = shape_predictor(frame, face)
-                
-                left_eye_pts = np.array([(landmarks.part(i).x, landmarks.part(i).y) for i in range(36, 42)])
-                right_eye_pts = np.array([(landmarks.part(i).x, landmarks.part(i).y) for i in range(42, 48)])
-                
-                left_EAR = eye_aspect_ratio(left_eye_pts)
-                right_EAR = eye_aspect_ratio(right_eye_pts)
-                avg_EAR = (left_EAR + right_EAR) / 2.0
+            # Display last detected person info
+            cv2.putText(frame, f"Detected: {last_detected_name} ({last_detected_nrp})",
+                        (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
 
-                if avg_EAR < EAR_THRESHOLD:
-                    blink_counter += 1
-                else:
-                    if blink_counter >= BLINK_FRAMES:
-                        blink_verified = True
-                        # print("✅ Kedipan terdeteksi! Memulai pengenalan wajah...")
-                    blink_counter = 0
-                
-                if not blink_verified:
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                    cv2.putText(frame, "Silakan berkedip!", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-                    continue  
-                
-                encoding = np.array(face_recognizer.compute_face_descriptor(frame, landmarks))
-
-                distances = [np.linalg.norm(encoding - known_encoding) for known_encoding in known_encodings]
-                min_distance = min(distances)
-                match_index = distances.index(min_distance)
-                
-                if min_distance < 0.6:
-                    name = known_names[match_index]
-                    accuracy = (1 - min_distance / 0.6) * 100
-                else:
-                    name = "Unknown"
-                    accuracy = 0
-
-                if accuracy < accuracy_threshold:
-                    name = "Unknown"
-                    color = (0, 0, 255)  
-                else:
-                    color = (0, 255, 0)  
-                
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                cv2.putText(frame, f"{name} ({accuracy:.2f}%)", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            
             cv2.imshow("Face Recognition", frame)
 
-            if len(faces) == 0:
-                blink_verified = False  
-
-            if cv2.waitKey(1) & 0xFF == ord("x") or cv2.getWindowProperty("Face Recognition", cv2.WND_PROP_VISIBLE) < 1:
+            if cv2.waitKey(1) & 0xFF == ord("x"):
                 break
 
     finally:
         video_capture.release()
         cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main_loop()
