@@ -9,6 +9,7 @@ from firebase_admin import credentials, db
 import pytz
 import time
 import threading
+import RPi.GPIO as GPIO
 
 # Firebase Setup
 cred = credentials.Certificate("face-detection-9f00c-firebase-adminsdk-fbsvc-cea00cf052.json")
@@ -37,7 +38,7 @@ with open(NAMES_FILE, "r") as f:
     known_data = json.load(f)
 
 accuracy_threshold = 60.0
-hold_time = 5  # Seconds to maintain confidence
+hold_time = 3  # Seconds to maintain confidence
 frame_skip = 2  # Process every 2nd frame
 
 # Track detected faces over time
@@ -48,6 +49,19 @@ lock = threading.Lock()
 last_detected_name = "No Person Detected"
 last_detected_nrp = "-"
 
+# === GPIO Setup ===
+GPIO.setmode(GPIO.BOARD)
+GPIO.setup(11, GPIO.OUT)  # Solenoid
+GPIO.setup(13, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # Limit switch
+
+def bukaSolenoid():
+    GPIO.output(11, True)
+
+def tutupSolenoid():
+    GPIO.output(11, False)
+
+def is_door_closed():
+    return GPIO.input(13) == 0  # adjust logic as needed
 
 def push_to_firebase(name, nrp):
     """Push detected face name, NRP & timestamp to Firebase (excluding 'Unknown')"""
@@ -80,6 +94,16 @@ def track_face(name, nrp, accuracy):
 
             if elapsed_time >= hold_time:
                 push_to_firebase(name, nrp)
+                print(f"[✅] Recognized {name} - Opening Door")
+                bukaSolenoid()
+
+                # Wait until door is closed
+                timeout = time.time() + 10
+                while not is_door_closed() and time.time() < timeout:
+                    time.sleep(0.2)
+
+                print("[🔒] Closing Door")
+                tutupSolenoid()
                 del detection_timers[name]  # Reset timer after logging
         else:
             if name in detection_timers:
@@ -140,7 +164,14 @@ def main_loop():
             ret, frame = video_capture.read()
             if not ret:
                 continue
+            if GPIO.input(15) == 0:
+                print("[🔒] Opening Door")
+                bukaSolenoid()
+                while not is_door_closed():
+                    time.sleep(0.2)
 
+                print("[🔒] Closing Door")
+                tutupSolenoid()
             frame_count += 1
             if frame_count % frame_skip == 0:  # Process only every N-th frame
                 threading.Thread(target=process_frame, args=(frame.copy(),)).start()
@@ -157,6 +188,8 @@ def main_loop():
     finally:
         video_capture.release()
         cv2.destroyAllWindows()
+        print("\nExiting and cleaning up GPIO...")
+        GPIO.cleanup()
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import numpy as np
 import time
 import firebase_admin
 from firebase_admin import credentials, db
-import tqdm
+from tqdm import tqdm
 import random
 import faiss
 import json
